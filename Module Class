@@ -1,0 +1,2409 @@
+
+torch.set_num_threads(6)
+class MultiHeadActionMaskRLModule(TorchRLModule, ValueFunctionAPI):
+    """Multi-head categorical policy with counterfactual baselines and gradient stability"""
+        
+    def __init__(self, config=None, observation_space=None, action_space=None, inference_only=False, learner_only=False, model_config=None, catalog_class=None, **kwargs):
+        """Initialize the RLModule with new API - handles catalog_class and other RLLib parameters"""
+        # Handle both old and new API for compatibility
+        self._cache_lock = threading.Lock()
+        self.num_cpus = mp.cpu_count()
+        self.parallel_workers = max(2, int(self.num_cpus * 0.75))
+        self.cpu_worker_pool = ThreadPoolExecutor(max_workers=self.parallel_workers)
+        
+        # Set PyTorch threading
+        torch.set_num_threads(self.parallel_workers)
+        torch.set_num_interop_threads(self.parallel_workers)
+        if config is not None:
+            # Old API - extract parameters from config
+            if hasattr(config, 'observation_space'):
+                observation_space = config.observation_space
+                action_space = config.action_space
+                inference_only = getattr(config, 'inference_only', False)
+                learner_only = getattr(config, 'learner_only', False)
+                model_config = getattr(config, 'model_config', {})
+            else:
+                # Config is a dict
+                observation_space = config.get('observation_space', observation_space)
+                action_space = config.get('action_space', action_space)
+                inference_only = config.get('inference_only', inference_only)
+                learner_only = config.get('learner_only', learner_only)
+                model_config = config.get('model_config', model_config or {})
+        
+        # ULTRA-FAST: Store catalog_class but don't use it (RLLib compatibility)
+        self.catalog_class = catalog_class
+        
+        # Use new API with all supported parameters
+        super().__init__(
+            observation_space=observation_space,
+            action_space=action_space,
+            inference_only=inference_only,
+            learner_only=learner_only,
+            model_config=model_config or {},
+            **kwargs  # Pass through any additional RLLib parameters
+        )
+        
+        # Store config for backward compatibility
+        if config is not None:
+            self.config = config
+        else:
+            # Create config-like object for backward compatibility
+            class ConfigLike:
+                def __init__(self, obs_space, act_space, inf_only, learn_only, mod_config):
+                    self.observation_space = obs_space
+                    self.action_space = act_space
+                    self.inference_only = inf_only
+                    self.learner_only = learn_only
+                    self.model_config = mod_config or {}
+            
+            self.config = ConfigLike(observation_space, action_space, inference_only, learner_only, model_config or {})
+        
+        # ULTRA-FAST: Pre-allocated tensor pools and caches
+        self._tensor_pool = {}
+        self._attention_cache = {}
+        self._encoder_cache = {}
+        self._mask_slice_cache = None
+        self._component_batch_cache = {}
+        self._q_input_cache = {}
+        
+        # ULTRA-FAST: Initialize SAC components immediately to reduce setup time
+        self._setup_sac_components()
+    def clear_episode_caches(self):
+        """Clear all caches at episode boundaries with debugging"""
+        
+        # DEBUG: Log cache states before clearing
+        worker_logger.warning(
+            f"Pre-clear cache sizes: encoder={len(self._encoder_cache)}, "
+            f"q_input={len(self._q_input_cache)}, "
+            f"attention={len(self._attention_cache)}, "
+            f"tensor_pool={len(self._tensor_pool)}",
+            extra={'worker_id': get_ray_worker_id()}
+        )
+        
+        # FIX: Nuclear clear - don't keep any cached tensors
+        self._encoder_cache.clear()
+        self._component_batch_cache.clear() 
+        self._q_input_cache.clear()
+        self._attention_cache.clear()
+        self._tensor_pool.clear()  # Clear everything, don't keep any
+        
+        # FIX: Clear mask cache that might accumulate
+        self._mask_slice_cache = None
+        
+        # FIX: Force clear dynamic fusion networks completely
+        if hasattr(self, 'qf_encoder') and hasattr(self.qf_encoder, 'fusion_networks'):
+            self.qf_encoder.fusion_networks.clear()
+            worker_logger.warning("Cleared qf_encoder fusion networks")
+        
+        if hasattr(self, 'qf_twin_encoder') and hasattr(self.qf_twin_encoder, 'fusion_networks'):
+            self.qf_twin_encoder.fusion_networks.clear()
+            worker_logger.warning("Cleared qf_twin_encoder fusion networks")
+        
+        # FIX: Clear any module buffers that might accumulate
+        for module in self.modules():
+            if hasattr(module, '_buffers'):
+                # Check for high-version buffers
+                for name, buffer in module._buffers.items():
+                    if buffer is not None and hasattr(buffer, '_version') and buffer._version > 10:
+                        worker_logger.warning(f"High version buffer found: {name} version {buffer._version}")
+                        # Replace with fresh buffer
+                        module._buffers[name] = buffer.detach().clone()
+        
+        # FIX: Aggressive garbage collection
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # DEBUG: Check parameter versions after clear
+        high_version_params = []
+        for name, param in self.named_parameters():
+            if hasattr(param, '_version') and param._version > 15:
+                high_version_params.append((name, param._version))
+        
+        if high_version_params:
+            worker_logger.warning(f"High version parameters after cache clear: {high_version_params}")
+        
+        worker_logger.warning(
+            "Episode cache clear complete with nuclear option",
+            extra={'worker_id': get_ray_worker_id()}
+        )
+
+
+    def _create_content_hash(self, obs_dict):
+        """Create hash based on observation content"""
+        hash_parts = []
+        for key in sorted(obs_dict.keys()):
+            if isinstance(obs_dict[key], torch.Tensor):
+                # Use shape and a sample of values for hash
+                tensor = obs_dict[key]
+                hash_parts.append(f"{key}:{tensor.shape}:{tensor.flatten()[:10].sum().item()}")
+            else:
+                hash_parts.append(f"{key}:{str(obs_dict[key])[:50]}")
+        return hash("_".join(hash_parts))
+    def debug_action_space(self, actions):
+        """Debug action space configuration"""
+        print(f"Action tensor shape: {actions.shape}")
+        print(f"Action component sizes: {self.action_component_sizes}")
+        print(f"Actions min/max per dimension:")
+        for i in range(actions.shape[1]):
+            dim_actions = actions[:, i]
+            print(f"  Dim {i}: min={dim_actions.min().item()}, max={dim_actions.max().item()}, expected_size={self.action_component_sizes[i] if i < len(self.action_component_sizes) else 'N/A'}")
+        
+        # Print first few action vectors
+        print(f"First 5 action vectors:")
+        for i in range(min(5, actions.shape[0])):
+            print(f"  {actions[i].tolist()}")
+    def _get_cached_tensor(self, key, shape, dtype, device, max_cache_size=100):
+        """Create fresh tensors instead of cached ones to avoid in-place modifications"""
+        # Don't cache tensors that will be modified - just create fresh ones
+        return torch.zeros(shape, dtype=dtype, device=device)
+    
+    def _setup_sac_components(self):
+        obs_space = self.config.observation_space
+        action_space = self.config.action_space
+        
+        # Get worker ID for logging
+        worker_id = get_ray_worker_id()
+        log_extra = {'worker_id': worker_id}
+        
+        # Calculate obs_size based on structured observation space
+        if isinstance(obs_space, spaces.Dict):
+            # For structured observations, calculate individual component sizes
+            total_obs_size = 0
+            self.obs_component_sizes = {}
+            self.obs_component_shapes = {}
+            
+            # Process each component in the structured observation
+            for key, component_space in obs_space.spaces.items():
+                if hasattr(component_space, 'shape') and component_space.shape:
+                    component_size = int(np.prod(component_space.shape))
+                    self.obs_component_sizes[key] = component_size
+                    self.obs_component_shapes[key] = component_space.shape
+                    total_obs_size += component_size
+                else:
+                    # Fallback for components without shape
+                    self.obs_component_sizes[key] = 100
+                    self.obs_component_shapes[key] = (100,)
+                    total_obs_size += 100
+            
+            obs_size = int(total_obs_size)
+
+        else:
+            # Fallback to flattened observation space
+            if hasattr(obs_space, "shape") and obs_space.shape:
+                obs_size = int(np.prod(obs_space.shape))
+            else:
+                obs_size = 1000  # Conservative fallback
+            self.obs_component_sizes = None
+            self.obs_component_shapes = None
+        
+        # Store obs_size as instance variable
+        self.obs_size = obs_size
+        
+        worker_logger.warning(f"Setting up hybrid continuous/discrete RL module for {obs_size}D observations", extra=log_extra)
+        
+        # Get action configuration from constants
+        from .constants import get_strategy_action_space
+        
+        # Get strategy name from config or use default
+        # Try dict-like access first (new RLlib API)
+        if hasattr(self.config, "get"):
+            model_config = self.config.get("model_config", {})
+        else:
+            model_config = getattr(self.config, "model_config", {})
+
+        if "strategy_name" not in model_config or not model_config["strategy_name"]:
+            raise ValueError("No strategy_name provided in model_config!")
+        strategy_name = model_config["strategy_name"]
+
+        self.action_config = get_strategy_action_space(strategy_name)
+        
+        # Extract timing and parameter configurations
+        self.timing_action_size = self.action_config['timing']['n']
+        self.parameter_configs = self.action_config['parameters']
+        
+        # Count total parameters for logging
+        total_parameters = len(self.parameter_configs)
+        continuous_parameters = sum(1 for p in self.parameter_configs if p['type'] == 'continuous')
+        discrete_parameters = sum(1 for p in self.parameter_configs if p['type'] == 'discrete')
+        
+        worker_logger.warning(f"Timing action size: {self.timing_action_size}", extra=log_extra)
+        worker_logger.warning(f"Total parameters: {total_parameters} ({continuous_parameters} continuous, {discrete_parameters} discrete)", extra=log_extra)
+        
+        # Create action component sizes for compatibility with existing code
+        self.action_component_sizes = [self.timing_action_size]
+        for param_config in self.parameter_configs:
+            if param_config['type'] == 'discrete':
+                self.action_component_sizes.append(param_config['n'])
+            else:
+                # For continuous parameters, we treat them as single actions in the discrete representation
+                self.action_component_sizes.append(1)
+        
+        worker_logger.warning(f"Action component sizes: {self.action_component_sizes}", extra=log_extra)
+        
+        # Create additional attributes for compatibility
+        self.num_heads = len(self.action_component_sizes)
+        self.mask_keys = [f"head_{i}" for i in range(self.num_heads)]  # Generic mask keys
+        
+        # Create mask indices for action masking
+        self.mask_indices = [0]
+        cumulative = 0
+        for size in self.action_component_sizes:
+            cumulative += size
+            self.mask_indices.append(cumulative)
+        
+        # Structure action sizes (all except timing)
+        self.structure_action_sizes = self.action_component_sizes[1:]
+        
+        # Gradient stabilization parameters - MOVE BEFORE Q-function creation
+        self.gradient_clip_norm = 1.0
+        self.feature_scale = 0.1  # Scale down intermediate features
+        self.residual_scale = 0.5  # Scale residual connections
+        
+        # Conditional learning parameter - ULTRA-FAST: Enable selective gradient computation
+        self.enable_conditional_learning = True
+        self.parameter_detach_strength = 0.5  # Add missing parameter detach strength
+        
+        # Advanced MLP configuration with gradient stability
+        mlp_config = self._get_stable_mlp_config(obs_size)
+        worker_logger.warning(f"Stable MLP config: {mlp_config}", extra=log_extra)
+        
+        # Create separate component encoders for structured observations FIRST
+        if self.obs_component_sizes and isinstance(obs_space, spaces.Dict):
+            self.component_encoders = nn.ModuleDict()
+            component_feature_dims = {}
+            
+            for component_name, component_size in self.obs_component_sizes.items():
+                if component_name == "action_mask":
+                    continue  # Skip action mask - it's not processed through encoders
+                
+                # Check if component shapes are available
+                if self.obs_component_shapes is None:
+                    # Fallback to basic encoder
+                    encoder = self._create_basic_encoder(component_size)
+                    feature_dim = 32
+                # Create specialized encoder for each component based on its nature
+                elif component_name == "option_chain":
+                    # Option chain needs specialized processing for strikes/expirations
+                    encoder = self._create_option_chain_encoder(self.obs_component_shapes[component_name])
+                    feature_dim = 256  # Output feature dimension
+                elif component_name == "market":
+                    # Market data encoder
+                    encoder = self._create_market_encoder(component_size)
+                    feature_dim = 64
+                elif component_name == "portfolio":
+                    # Portfolio encoder
+                    encoder = self._create_portfolio_encoder(component_size)
+                    feature_dim = 64
+                elif component_name == "positions":
+                    # Positions encoder with attention over positions
+                    if self.obs_component_shapes is not None:
+                        encoder = self._create_positions_encoder(self.obs_component_shapes[component_name])
+                    else:
+                        encoder = self._create_basic_encoder(component_size)
+                    feature_dim = 128
+                elif component_name == "environment":
+                    # Environment state encoder
+                    encoder = self._create_environment_encoder(component_size)
+                    feature_dim = 32
+                else:
+                    # Generic encoder for other components
+                    encoder = self._create_generic_component_encoder(component_size)
+                    feature_dim = 64
+                
+                self.component_encoders[component_name] = encoder
+                component_feature_dims[component_name] = feature_dim
+            import torch.utils.checkpoint as checkpoint
+            if hasattr(self, 'component_encoders'):
+                for name, encoder in self.component_encoders.items():
+                    self.component_encoders[name] = (encoder)
+                
+                worker_logger.warning(f"Applied gradient checkpointing to {len(self.component_encoders)} component encoders", 
+                                    extra={'worker_id': get_ray_worker_id()})
+            
+            # Total feature dimension after component encoding
+            total_component_features = sum(component_feature_dims.values())
+            
+            # Create fusion network to combine component features
+            self.component_fusion = self._create_component_fusion_network(
+                component_feature_dims, mlp_config['final_dim']
+            )
+            
+            # Set the encoder to use component-based processing
+            self.mlp_encoder = None  # We'll use component encoders instead
+            self.component_feature_dims = component_feature_dims
+            
+            worker_logger.warning(f"Created component encoders: {list(self.component_encoders.keys())}", extra=log_extra)
+            worker_logger.warning(f"Component feature dimensions: {component_feature_dims}", extra=log_extra)
+        else:
+            # Fallback to traditional MLP encoder for flattened observations
+            self.mlp_encoder = self._create_stable_mlp_encoder(obs_size, mlp_config)
+            self.component_encoders = None
+            self.component_fusion = None
+            self.component_feature_dims = None
+        
+        # Calculate total action dimension for Q-functions
+        total_action_dim = self.timing_action_size + sum(
+            2 if p['type'] == 'continuous' else p['n'] 
+            for p in self.parameter_configs
+        )
+        
+        # CRITICAL: Create Q-function encoders FIRST - REQUIRED NAMES FOR SAC
+        def make_stable_q_encoder():
+            if hasattr(self, 'component_encoders') and self.component_encoders:
+                return self._create_stable_component_q_encoder(obs_space, total_action_dim)
+            else:
+                return self._create_stable_q_encoder(obs_size, total_action_dim)
+        
+        self.qf_encoder = make_stable_q_encoder()
+        self.qf_twin_encoder = make_stable_q_encoder()
+
+        worker_logger.warning("Applied gradient checkpointing to Q-function encoders", 
+                            extra={'worker_id': get_ray_worker_id()})
+        # Q-function heads
+        self.qf = self._create_stable_q_head()
+        self.qf_twin = self._create_stable_q_head()
+        
+        # Target networks - CREATE FRESH INSTANCES (don't copy state dict yet)
+        self.qf_target = self._create_stable_q_head()
+        self.qf_twin_target = self._create_stable_q_head()
+        self.qf_target_encoder = make_stable_q_encoder()
+        self.qf_twin_target_encoder = make_stable_q_encoder()
+        
+        # Target encoders - REQUIRED FOR SAC
+        if hasattr(self, 'component_encoders') and self.component_encoders:
+            self.qf_target_encoder = self._create_stable_component_q_encoder(obs_space, total_action_dim)
+            self.qf_twin_target_encoder = self._create_stable_component_q_encoder(obs_space, total_action_dim)
+        else:
+            self.qf_target_encoder = make_stable_q_encoder()
+            self.qf_twin_target_encoder = make_stable_q_encoder()
+        
+        # Policy encoder (convenience wrapper) - REQUIRED FOR SAC COMPATIBILITY
+        if hasattr(self, 'component_encoders') and self.component_encoders:
+            # ULTRA-FAST: Create a wrapper encoder that uses component encoders for SAC compatibility
+            class ComponentPolicyEncoder(nn.Module):
+                def __init__(self, component_encoders, component_fusion):
+                    super().__init__()
+                    self.component_encoders = component_encoders
+                    self.component_fusion = component_fusion
+                
+                def forward(self, obs_dict):
+                    """Forward pass for component-based encoding"""
+                    if not isinstance(obs_dict, dict) or not self.component_encoders:
+                        # Fallback for non-dict observations
+                        if isinstance(obs_dict, torch.Tensor):
+                            return obs_dict
+                        else:
+                            return torch.zeros(1, 384, dtype=torch.float32)
+                    
+                    component_features = []
+                    component_order = ["option_chain", "market", "portfolio", "positions", "environment"]
+                    
+                    for component_name in component_order:
+                        if component_name in obs_dict and component_name in self.component_encoders:
+                            component_data = obs_dict[component_name]
+                            
+                            # ULTRA-FAST: Use as_tensor for speed
+                            if not isinstance(component_data, torch.Tensor):
+                                component_data = torch.as_tensor(component_data, dtype=torch.float32)
+                            
+                            # Apply component encoder
+                            try:
+                                component_features_encoded = self.component_encoders[component_name](component_data)
+                                component_features.append(component_features_encoded)
+                            except Exception:
+                                # Fallback dummy features
+                                batch_size = component_data.shape[0] if component_data.dim() > 0 else 1
+                                dummy_features = torch.zeros(batch_size, 64, dtype=torch.float32, device=component_data.device)
+                                component_features.append(dummy_features)
+                    
+                    if component_features:
+                        concatenated_features = torch.cat(component_features, dim=-1)
+                        
+                        if self.component_fusion:
+                            try:
+                                result = self.component_fusion(concatenated_features)
+                                return result
+                            except Exception:
+                                return concatenated_features
+                        return concatenated_features
+                    else:
+                        return torch.zeros(1, 384, dtype=torch.float32)
+            
+            # CRITICAL: SAC requires pi_encoder attribute - create wrapper
+            self.pi_encoder = ComponentPolicyEncoder(self.component_encoders, self.component_fusion)
+        else:
+            # Traditional encoder - REQUIRED FOR SAC
+            self.pi_encoder = self.mlp_encoder
+        
+        # Policy heads with gradient-stable shared trunk
+        policy_feature_dim = mlp_config['final_dim']
+        self.policy_trunk = self._create_stable_policy_trunk(policy_feature_dim)
+        
+        # Create individual heads for timing and each parameter
+        self.timing_head = self._create_stable_action_head(480, self.timing_action_size)  # Full 480, not 240
+        
+        # Parameter heads - separate for each parameter
+        self.parameter_heads = nn.ModuleDict()
+        for param_config in self.parameter_configs:
+            param_name = param_config['name']
+            if param_config['type'] == 'continuous':
+                output_size = 2
+            else:
+                output_size = param_config['n']
+            
+            # FIXED - use 480 to match policy trunk output:
+            self.parameter_heads[param_name] = self._create_stable_action_head(
+                480, output_size  # ← FIXED: 480 instead of policy_feature_dim // 2
+            )
+        
+        # CREATE PI ATTRIBUTE FOR SAC COMPATIBILITY
+        class HybridPolicyNetwork(nn.Module):
+            def __init__(self, encoder, trunk, timing_head, parameter_heads, parameter_configs, obs_component_sizes, feature_scale=0.1, component_encoders=None, component_fusion=None, obs_component_shapes=None):
+                super().__init__()
+                self.encoder = encoder
+                self.trunk = trunk
+                self.timing_head = timing_head
+                self.parameter_heads = parameter_heads
+                self.parameter_configs = parameter_configs
+                self.obs_component_sizes = obs_component_sizes
+                self.obs_component_shapes = obs_component_shapes
+                self.feature_scale = feature_scale
+                
+                # Component-based processing
+                self.component_encoders = component_encoders
+                self.component_fusion = component_fusion
+                self.use_component_encoding = component_encoders is not None
+            
+            def forward(self, x):
+                # ULTRA-FAST: Use encoder directly for all cases (handles both component and traditional)
+                if isinstance(x, dict):
+                    # For structured observations, use encoder's forward method
+                    features = self.encoder(x) * self.feature_scale
+                else:
+                    # For non-dict observations, normalize first then encode
+                    x_norm = self._normalize_input(x)
+                    features = self.encoder(x_norm) * self.feature_scale
+                
+                trunk_out = self.trunk(features)
+                
+                # Timing head output (discrete)
+                timing_logits = self.timing_head(trunk_out)
+                if timing_logits.requires_grad:
+                    timing_logits.register_hook(lambda grad: torch.clamp(grad, -1.0, 1.0))
+                
+                # Parameter head outputs (mixed continuous/discrete)
+                param_outputs = [timing_logits]
+                for param_config in self.parameter_configs:
+                    param_name = param_config['name']
+                    param_output = self.parameter_heads[param_name](trunk_out)
+                    if param_output.requires_grad:
+                        param_output.register_hook(lambda grad: torch.clamp(grad, -1.0, 1.0))
+                    param_outputs.append(param_output)
+                
+                return torch.cat(param_outputs, dim=-1)
+            
+            def _process_structured_obs_with_components(self, obs_dict):
+                """Process structured observations using component encoders (NO FLATTENING)"""
+                if not isinstance(obs_dict, dict) or not self.component_encoders:
+                    return obs_dict
+                
+                component_features = []
+                
+                # Process each component with its specialized encoder
+                component_order = ["option_chain", "market", "portfolio", "positions", "environment"]
+                
+                for component_name in component_order:
+                    if component_name in obs_dict and component_name in self.component_encoders:
+                        component_data = obs_dict[component_name]
+                        
+                        # ULTRA-FAST: Use as_tensor instead of tensor for speed
+                        if not isinstance(component_data, torch.Tensor):
+                            component_data = torch.as_tensor(component_data, dtype=torch.float32)
+                        
+                        # ULTRA-FAST: Cache shape lookups and avoid repeated dictionary access
+                        if component_name == "market":
+                            expected_shape = (10,)  # Force 10 features
+                        else:
+                            expected_shape = self.obs_component_shapes.get(component_name) if self.obs_component_shapes is not None else None
+
+                        if expected_shape and component_data.shape[-len(expected_shape):] != expected_shape:
+                            # Check if reshaping is mathematically possible
+                            if component_data.dim() > len(expected_shape):
+                                batch_size = component_data.shape[0]
+                                actual_feature_size = int(np.prod(component_data.shape[1:]))
+                                expected_total = int(np.prod(expected_shape))
+                                
+                                if actual_feature_size == expected_total:
+                                    component_data = component_data.view(batch_size, *expected_shape)
+                        
+                        # Apply component-specific encoder
+                        try:
+                            component_features_encoded = self.component_encoders[component_name](component_data)
+                            component_features.append(component_features_encoded)
+                        except Exception as e:
+                            # Fallback for component encoding errors
+                            # ULTRA-FAST: Pre-allocate dummy features
+                            batch_size = component_data.shape[0] if component_data.dim() > 0 else 1
+                            dummy_features = torch.zeros(batch_size, 64, dtype=torch.float32, device=component_data.device)
+                            component_features.append(dummy_features)
+                
+                if component_features:
+                    # ULTRA-FAST: Fuse component features with pre-computed dimensions
+                    concatenated_features = torch.cat(component_features, dim=-1)
+                    
+                    # ULTRA-FAST: Cache dimension checks
+                    if hasattr(self.component_fusion, 'component_feature_dims'):
+                        expected_dim = sum(self.component_fusion.component_feature_dims.values())
+                        actual_dim = concatenated_features.shape[-1]
+                        
+                        if self.component_fusion and actual_dim == expected_dim:
+                            try:
+                                fused_features = self.component_fusion(concatenated_features)
+                                return fused_features
+                            except Exception as e:
+                                # Fallback: return concatenated features if fusion fails
+                                return concatenated_features
+                    
+                    # Dimension mismatch or no fusion network - return concatenated features
+                    return concatenated_features
+                else:
+                    # ULTRA-FAST: Pre-allocate dummy features with cached batch size
+                    batch_size = 1
+                    for value in obs_dict.values():
+                        if isinstance(value, torch.Tensor) and value.dim() > 0:
+                            batch_size = value.shape[0]
+                            break
+                    
+                    return torch.zeros(batch_size, 384, dtype=torch.float32)  # Default feature size
+            
+            def _process_structured_obs(self, obs_dict):
+                """Process structured observation dict while maintaining relationships (FALLBACK WITH FLATTENING)"""
+                if isinstance(obs_dict, dict):
+                    processed_components = []
+                    
+                    # Process components in a specific order to maintain consistency
+                    component_order = ["option_chain", "market", "portfolio", "positions", "environment"]
+                    
+                    for key in component_order:
+                        if key in obs_dict:
+                            component = obs_dict[key]
+                            
+                            # ULTRA-FAST: Use as_tensor instead of tensor for speed
+                            if not isinstance(component, torch.Tensor):
+                                component = torch.as_tensor(component, dtype=torch.float32)
+                            
+                            # ULTRA-FAST: Handle the component based on its structure - cached processing
+                            if key == "option_chain":
+                                # Special handling for option chain to preserve strike/expiry relationships
+                                processed_component = self._process_option_chain(component)
+                            elif key == "market":
+                                # Market data processing
+                                processed_component = self._process_market_data(component)
+                            elif key == "portfolio":
+                                # Portfolio processing
+                                processed_component = self._process_portfolio_data(component)
+                            elif key == "positions":
+                                # Position data processing
+                                processed_component = self._process_position_data(component)
+                            elif key == "environment":
+                                # Environment state processing
+                                processed_component = self._process_environment_data(component)
+                            else:
+                                # Generic processing for other components
+                                processed_component = self._process_generic_component(component)
+                            
+                            processed_components.append(processed_component)
+                    
+                    if processed_components:
+                        # ULTRA-FAST: Concatenate all processed components
+                        return torch.cat(processed_components, dim=-1)
+                    else:
+                        # ULTRA-FAST: Pre-allocated fallback tensor
+                        return torch.zeros(1, 1000, dtype=torch.float32)
+                else:
+                    # Already flattened or non-dict input
+                    return obs_dict
+            
+            def _process_option_chain(self, option_chain):
+                """Process option chain while preserving strike/expiry structure"""
+                if option_chain.dim() > 1:
+                    # If multi-dimensional, preserve the first dimension and flatten others selectively
+                    batch_size = option_chain.shape[0]
+                    # Reshape to preserve batch dimension
+                    flattened = option_chain.view(batch_size, -1)
+                else:
+                    flattened = option_chain.flatten()
+                return flattened
+            
+            def _process_market_data(self, market_data):
+                """Process market data preserving key relationships"""
+                if market_data.dim() > 1:
+                    batch_size = market_data.shape[0]
+                    flattened = market_data.view(batch_size, -1)
+                else:
+                    flattened = market_data.flatten()
+                return flattened
+            
+            def _process_portfolio_data(self, portfolio_data):
+                """Process portfolio data"""
+                if portfolio_data.dim() > 1:
+                    batch_size = portfolio_data.shape[0]
+                    flattened = portfolio_data.view(batch_size, -1)
+                else:
+                    flattened = portfolio_data.flatten()
+                return flattened
+            
+            def _process_position_data(self, position_data):
+                """Process position data"""
+                if position_data.dim() > 1:
+                    batch_size = position_data.shape[0]
+                    flattened = position_data.view(batch_size, -1)
+                else:
+                    flattened = position_data.flatten()
+                return flattened
+            
+            def _process_environment_data(self, env_data):
+                """Process environment state data"""
+                if env_data.dim() > 1:
+                    batch_size = env_data.shape[0]
+                    flattened = env_data.view(batch_size, -1)
+                else:
+                    flattened = env_data.flatten()
+                return flattened
+            
+            def _process_generic_component(self, component):
+                """Generic component processing"""
+                if component.dim() > 1:
+                    batch_size = component.shape[0]
+                    flattened = component.view(batch_size, -1)
+                else:
+                    flattened = component.flatten()
+                return flattened
+            
+            def _normalize_input(self, obs):
+                """Wrapper for JIT compiled normalization"""
+                return _normalize_input_fast(obs)
+        
+        self.pi = HybridPolicyNetwork(
+            encoder=self.pi_encoder,  # ULTRA-FAST: Use pi_encoder (works for both component and traditional)
+            trunk=self.policy_trunk,
+            timing_head=self.timing_head,
+            parameter_heads=self.parameter_heads,
+            parameter_configs=self.parameter_configs,
+            obs_component_sizes=self.obs_component_sizes,
+            obs_component_shapes=self.obs_component_shapes,
+            feature_scale=self.feature_scale,
+            component_encoders=self.component_encoders,
+            component_fusion=self.component_fusion
+        )
+        
+        # Value head with gradient stability
+        self.value_head = self._create_stable_value_head(policy_feature_dim)
+        
+        # Alpha parameter with gradient clipping
+        self.log_alpha = nn.Parameter(torch.tensor(0.0))
+        
+        # Masking configuration - adapted for hybrid actions
+        self.inv_temperature = 1.0 / 0.9
+        self.mask_min = -1.0e2  # Less extreme masking to prevent gradient issues
+        
+        # Initialize weights with gradient-stable initialization
+        self._init_weights_manually()
+        self._setup_enhanced_mixed_precision()
+        self._setup_cuda_streams()
+
+
+
+        # THEN initialize target networks (after weights are set)
+        try:
+            self.qf_target.load_state_dict(self.qf.state_dict())
+            self.qf_twin_target.load_state_dict(self.qf_twin.state_dict())
+            # Skip encoder state dict copying for dynamic encoders
+            if not (hasattr(self, 'component_encoders') and self.component_encoders):
+                self.qf_target_encoder.load_state_dict(self.qf_encoder.state_dict())
+                self.qf_twin_target_encoder.load_state_dict(self.qf_twin_encoder.state_dict())
+        except Exception as e:
+            worker_logger.warning(f"Target network initialization failed: {e}, continuing...", 
+                                extra={'worker_id': get_ray_worker_id()})
+        # Initialize target networks
+        self.qf_target.load_state_dict(self.qf.state_dict())
+        self.qf_twin_target.load_state_dict(self.qf_twin.state_dict())
+        
+        # View requirements - initialize dict first
+        self.view_requirements = {}
+        self.view_requirements["obs_next"] = ViewRequirement(
+            data_col="obs", shift=1, used_for_training=True
+        )
+        
+        # Register gradient clipping hooks
+        self._register_gradient_hooks()
+        
+        worker_logger.warning("Hybrid continuous/discrete RL module setup complete", extra=log_extra)
+    def _batch_process_components(self, obs_dict_list):
+        """Process multiple observation dictionaries in parallel"""
+        if len(obs_dict_list) == 1:
+            return [self.pi._process_structured_obs_with_components(obs_dict_list[0])]
+        
+        def process_single_obs(obs_dict):
+            return self.pi._process_structured_obs_with_components(obs_dict)
+        
+        with ThreadPoolExecutor(max_workers=min(len(obs_dict_list), self.parallel_workers)) as executor:
+            futures = [executor.submit(process_single_obs, obs_dict) for obs_dict in obs_dict_list]
+            results = [future.result() for future in futures]
+        
+        return results
+    
+    def load_state_dict(self, state_dict, strict=True):
+        """Load state dict with backwards compatibility for market state expansion from 6 to 10 features"""
+        # Get worker logger
+        worker_id = get_ray_worker_id()
+        log_extra = {'worker_id': worker_id}
+        
+        try:
+            # Create a compatible state dict by handling size mismatches
+            adapted_state_dict = {}
+            
+            for key, value in state_dict.items():
+                if 'market' in key and isinstance(value, torch.Tensor):
+                    # Handle market encoder size mismatch (6 -> 10 features)
+                    if value.shape == torch.Size([32, 6]) and hasattr(self, 'component_encoders'):
+                        # This is likely the first layer of market encoder expecting 6 features
+                        # We need to expand it to 10 features
+                        worker_logger.warning(f"Adapting market encoder layer {key} from 6 to 10 features", extra=log_extra)
+                        
+                        # Create new weight tensor with 10 input features
+                        new_weight = torch.zeros(32, 10, dtype=value.dtype)
+                        # Copy original weights for first 6 features
+                        new_weight[:, :6] = value
+                        # Initialize new features (7-10) with small random values
+                        new_weight[:, 6:] = torch.randn(32, 4, dtype=value.dtype) * 0.01
+                        adapted_state_dict[key] = new_weight
+                    else:
+                        adapted_state_dict[key] = value
+                else:
+                    adapted_state_dict[key] = value
+            
+            # Load the adapted state dict
+            return super().load_state_dict(adapted_state_dict, strict=False)
+            
+        except Exception as e:
+            worker_logger.warning(f"State dict loading failed: {e}, trying strict=False", extra=log_extra)
+            # Fallback to non-strict loading
+            return super().load_state_dict(state_dict, strict=False)
+    
+    def _apply_conditional_gradient_scaling(self, tensor, scale_factor):
+        """Apply gradient scaling using a custom autograd function"""
+        if not self.enable_conditional_learning or scale_factor >= 1.0:
+            return tensor
+        
+        # Custom gradient scaling function
+        class GradientScaler(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, input_tensor, scale):
+                ctx.scale = scale
+                return input_tensor
+            
+            @staticmethod
+            def backward(ctx, grad_output):
+                return grad_output * ctx.scale, None
+        
+        return GradientScaler.apply(tensor, scale_factor)
+    
+    def _get_position_state_from_observations(self, observations):
+        """Extract position state from structured observations"""
+        has_open_position = False
+        
+        if isinstance(observations, dict):
+            # Method 1: Check environment state
+            if "environment" in observations:
+                env_state = observations["environment"]
+                if hasattr(env_state, '__len__') and len(env_state) > 0:
+                    env_flat = env_state.flatten() if hasattr(env_state, 'flatten') else env_state
+                    if len(env_flat) > 0:
+                        has_open_position = bool(env_flat[0] > 0)
+            
+            # Method 2: Check positions tensor as fallback
+            if not has_open_position and "positions" in observations:
+                positions = observations["positions"]
+                if hasattr(positions, '__len__') and len(positions) > 0:
+                    pos_flat = positions.flatten() if hasattr(positions, 'flatten') else positions
+                    # Check if any position has non-zero values (indicating active positions)
+                    if len(pos_flat) > 0:
+                        has_open_position = bool(torch.any(torch.abs(pos_flat) > 1e-6))
+        
+        return has_open_position
+    
+    def _get_stable_mlp_config(self, obs_size: int) -> dict:
+        """Gradient-stable MLP architecture for high-dimensional observations"""
+        return {
+            'layers': [obs_size, 1024, 768, 480],  # More gradual reduction
+            'final_dim': 480,  # Smaller final dimension
+            'use_residual': True,
+            'use_attention': False,  # Disable attention for stability
+            'use_layer_scale': True,  # Add layer scaling
+            'dropout_schedule': [0.05, 0.1, 0.1, 0.05]  # Progressive dropout
+        }
+    
+    def _create_stable_policy_trunk(self, input_dim: int) -> nn.Module:
+        """Create policy trunk with gradient stability"""
+        return nn.Sequential(
+            nn.Linear(input_dim, input_dim),           # 480 -> 480
+            LayerScale(input_dim),                     # LayerScale(480)
+            nn.LayerNorm(input_dim),                   # LayerNorm(480)
+            nn.GELU(),
+            nn.Dropout(0.05),
+            StableResidualBlock(input_dim, input_dim // 2, 0.1, self.residual_scale),  # 480 -> 480 (fixed)
+            nn.LayerNorm(input_dim),                   # FIX: LayerNorm(480) not 240
+            GradientClipActivation(),
+        )
+    def _create_stable_action_head(self, input_dim: int, output_dim: int) -> nn.Module:
+        """Create action head with gradient stability"""
+        return nn.Sequential(
+            StableResidualBlock(input_dim, input_dim, 0.05, self.residual_scale),
+            nn.Linear(input_dim, max(input_dim // 2, output_dim)),
+            nn.LayerNorm(max(input_dim // 2, output_dim)),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(max(input_dim // 2, output_dim), output_dim, bias=False),
+            # Apply gradient clipping to final layer
+            GradientClipLayer()
+        )
+    
+    def _create_stable_value_head(self, input_dim: int) -> nn.Module:
+        """Create value head with gradient stability"""
+        return nn.Sequential(
+            StableResidualBlock(input_dim, input_dim, 0.05, self.residual_scale),
+            nn.Linear(input_dim, input_dim // 2),
+            LayerScale(input_dim // 2),
+            nn.LayerNorm(input_dim // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(input_dim // 2, input_dim // 4),
+            nn.LayerNorm(input_dim // 4),
+            nn.GELU(),
+            nn.Linear(input_dim // 4, 1, bias=False),
+            GradientClipLayer()
+        )
+
+    def _create_stable_mlp_encoder(self, obs_size: int, config: dict) -> nn.Module:
+        """Create gradient-stable MLP encoder with multiple stability techniques"""
+        layers = config['layers']
+        use_residual = config['use_residual']
+        use_layer_scale = config['use_layer_scale']
+        dropout_schedule = config['dropout_schedule']
+        
+        modules = []
+        
+        # Input normalization and projection
+        modules.append(nn.LayerNorm(layers[0]))
+        modules.append(nn.Linear(layers[0], layers[1]))
+        if use_layer_scale:
+            modules.append(LayerScale(layers[1]))
+        modules.append(nn.LayerNorm(layers[1]))
+        modules.append(nn.GELU())
+        modules.append(nn.Dropout(dropout_schedule[0]))
+        
+        # Hidden layers with gradient-stable residual connections
+        for i in range(1, len(layers) - 1):
+            in_dim, out_dim = layers[i], layers[i + 1]
+            dropout_rate = dropout_schedule[min(i, len(dropout_schedule) - 1)]
+            
+            if use_residual and in_dim == out_dim:
+                modules.append(StableResidualBlock(in_dim, out_dim, dropout_rate, self.residual_scale))
+            else:
+                modules.append(nn.Linear(in_dim, out_dim))
+                if use_layer_scale:
+                    modules.append(LayerScale(out_dim))
+                modules.append(nn.LayerNorm(out_dim))
+                modules.append(nn.GELU())
+                modules.append(nn.Dropout(dropout_rate))
+        
+        # Final projection with gradient clipping
+        modules.append(nn.Linear(layers[-1], config['final_dim']))
+        modules.append(nn.LayerNorm(config['final_dim']))
+        modules.append(GradientClipActivation())
+        
+        return nn.Sequential(*modules)
+
+    def _create_stable_q_encoder(self, obs_size: int, action_dim: int) -> nn.Module:
+        """Create Q-function encoder with gradient stability"""
+        input_dim = obs_size + action_dim
+        
+        return nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, 1024),
+            LayerScale(1024),
+            nn.LayerNorm(1024),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            StableResidualBlock(1024, 1024, 0.1, self.residual_scale),
+            nn.Linear(1024, 512),
+            LayerScale(512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            GradientClipActivation()
+        )
+    def _create_stable_component_q_encoder(self, obs_space: spaces.Dict, action_dim: int) -> nn.Module:
+        """Create Q-function encoder for component-based observations - FIXED MEMORY LEAK"""
+        
+        class ComponentQEncoder(nn.Module):
+            def __init__(self, action_dim):
+                super().__init__()
+                self.action_dim = action_dim
+                
+                # Action processing layer
+                self.action_processor = nn.Sequential(
+                    nn.Linear(action_dim, 64),
+                    nn.LayerNorm(64),
+                    nn.GELU()
+                )
+                
+                # Pre-create fusion networks for common dimensions to avoid dynamic creation
+                self.fusion_networks = nn.ModuleDict()
+                self.action_feature_dim = 64
+                
+                # Pre-create for common obs dimensions based on your logs
+                common_dims = [2902, 476, 477, 1000, 2000, 3000, 2916, 2951]
+                for dim in common_dims:
+                    self.fusion_networks[str(dim)] = self._create_fusion_network(dim)
+                
+                # Track which dimensions we've seen to prevent repeated warnings
+                self._seen_dimensions = set(common_dims)
+            
+            def _create_fusion_network(self, obs_dim):
+                """Create fusion network with correct dimensions"""
+                total_input_dim = obs_dim + self.action_feature_dim
+                
+                return nn.Sequential(
+                    nn.Linear(total_input_dim, 512),
+                    LayerScale(512),
+                    nn.LayerNorm(512),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(512, 256),
+                    nn.LayerNorm(256),
+                    GradientClipActivation()
+                )
+            
+            def forward(self, obs_action_concat):
+                # Split obs and action
+                obs_features = obs_action_concat[:, :-self.action_dim]
+                action_features = obs_action_concat[:, -self.action_dim:]
+                
+                # Process action
+                action_processed = self.action_processor(action_features)
+                
+                # Combine obs and action features
+                combined = torch.cat([obs_features, action_processed], dim=-1)
+                
+                # Use pre-created fusion network or create if absolutely necessary
+                obs_dim = obs_features.shape[-1]
+                network_key = str(obs_dim)
+                
+                if network_key in self.fusion_networks:
+                    # Use existing pre-created network
+                    fusion_network = self.fusion_networks[network_key]
+                else:
+                    # Only create if absolutely necessary and warn once per dimension
+                    if obs_dim not in self._seen_dimensions:
+                        worker_id = get_ray_worker_id()
+                        worker_logger.warning(
+                            f"Creating new fusion network for obs_dim={obs_dim} - consider adding to common_dims. "
+                            f"This may cause memory accumulation.",
+                            extra={'worker_id': worker_id}
+                        )
+                        self._seen_dimensions.add(obs_dim)
+                    
+                    # Create and store the new network
+                    fusion_network = self._create_fusion_network(obs_dim)
+                    self.fusion_networks[network_key] = fusion_network
+                    
+                    # Move to correct device
+                    if combined.is_cuda:
+                        fusion_network = fusion_network.cuda()
+                    
+                    # Limit total networks to prevent unlimited growth
+                    if len(self.fusion_networks) > 20:
+                        # Remove least recently used networks (keep first 10)
+                        keys_to_remove = list(self.fusion_networks.keys())[10:]
+                        for key in keys_to_remove:
+                            del self.fusion_networks[key]
+                        
+                        worker_logger.warning(
+                            f"Fusion network cache exceeded 20 entries, removed {len(keys_to_remove)} networks",
+                            extra={'worker_id': get_ray_worker_id()}
+                        )
+                
+                return fusion_network(combined)
+        
+        return ComponentQEncoder(action_dim)
+        
+    def _create_stable_q_head(self) -> nn.Module:
+        """Create Q-function head with gradient stability"""
+        return nn.Sequential(
+            nn.Linear(256, 128),
+            LayerScale(128),
+            nn.LayerNorm(128),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
+            nn.GELU(),
+            nn.Linear(64, 1, bias=False),
+            GradientClipLayer()
+        )
+    
+    def _process_components_parallel_parallel(self, obs_dict):
+        """Process components in parallel using async execution"""
+        if not isinstance(obs_dict, dict) or not self.component_encoders:
+            return obs_dict
+        
+        # Prepare all inputs first
+        component_inputs = {}
+        for name in ["option_chain", "market", "portfolio", "positions", "environment"]:
+            if name in obs_dict and name in self.component_encoders:
+                data = obs_dict[name]
+                if not isinstance(data, torch.Tensor):
+                    data = torch.as_tensor(data, dtype=torch.float32)
+                component_inputs[name] = data
+        
+        # Process all components in parallel streams
+        component_features = []
+        streams = []
+        
+        for i, (name, data) in enumerate(component_inputs.items()):
+            stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+            streams.append(stream)
+            
+            if stream:
+                with torch.cuda.stream(stream):
+                    features = self.component_encoders[name](data)
+            else:
+                features = self.component_encoders[name](data)
+            component_features.append(features)
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        return torch.cat(component_features, dim=-1)
+    def _create_option_chain_encoder(self, shape: tuple) -> nn.Module:
+        import torch.nn as nn
+        import torch
+
+        num_strikes, num_expirations, num_types, num_features = shape
+
+        class LeanOptionChainEncoder(nn.Module):
+            def __init__(self, num_strikes, num_expirations, num_types, num_features):
+                super().__init__()
+                self.num_strikes = num_strikes
+                self.num_expirations = num_expirations
+                self.num_types = num_types
+
+                # Reduced channels to save memory
+                self.option_type_encoders = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Conv2d(num_features, 16, kernel_size=1),
+                        nn.GroupNorm(4, 16),
+                        nn.GELU(),
+                        nn.Dropout(0.05),
+
+                        nn.Conv2d(16, 24, kernel_size=(3, 1), padding=(1, 0)),
+                        nn.GroupNorm(4, 24),
+                        nn.GELU(),
+
+                        nn.Conv2d(24, 32, kernel_size=(1, 3), padding=(0, 1)),
+                        nn.GroupNorm(4, 32),
+                        nn.GELU(),
+                        nn.Dropout(0.1)
+                    ) for _ in range(num_types)
+                ])
+
+                # Adjusted cross-type fusion
+                self.cross_type_fusion = nn.Sequential(
+                    nn.Conv2d(32 * num_types, 48, kernel_size=1),
+                    nn.GroupNorm(4, 48),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+
+                    nn.Conv2d(48, 48, kernel_size=3, padding=1),
+                    nn.GroupNorm(4, 48),
+                    nn.GELU()
+                )
+
+                # Lower model dim and heads
+                self.strike_attention = nn.TransformerEncoderLayer(
+                    d_model=48, nhead=4, dim_feedforward=128, 
+                    dropout=0.1, batch_first=True, norm_first=True
+                )
+                self.expiry_attention = nn.TransformerEncoderLayer(
+                    d_model=48, nhead=4, dim_feedforward=128, 
+                    dropout=0.1, batch_first=True, norm_first=True
+                )
+
+                self.strike_pos_encoding = nn.Parameter(
+                    torch.randn(1, 48, num_strikes, 1) * 0.02
+                )
+                self.expiry_pos_encoding = nn.Parameter(
+                    torch.randn(1, 48, 1, num_expirations) * 0.02
+                )
+
+                self.importance_weighting = nn.Sequential(
+                    nn.Conv2d(48, 24, kernel_size=1),
+                    nn.GELU(),
+                    nn.Conv2d(24, 1, kernel_size=1),
+                    nn.Sigmoid()
+                )
+
+                # Smaller multi-resolution targets
+                self.multi_resolution_pools = nn.ModuleList([
+                    nn.AdaptiveAvgPool2d((6, 3)),
+                    nn.AdaptiveAvgPool2d((3, 2)),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                ])
+    
+
+    
+                 # BUT change the final output to match your working 256:
+                self.final_fusion = nn.Sequential(
+                    nn.Linear(48 * (6*3 + 3*2 + 1*1), 384),
+                    nn.LayerNorm(384),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+
+                    nn.Linear(384, 256),
+                    nn.LayerNorm(256),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+
+                    nn.Linear(256, 256),  # FINAL OUTPUT: 256 (your original)
+                    nn.LayerNorm(256),
+                    GradientClipActivation()
+                )
+
+            def forward(self, x):
+                batch_size = x.shape[0]
+                type_data_batch = x.permute(0, 3, 4, 1, 2)
+                type_data_flat = type_data_batch.reshape(batch_size * self.num_types, num_features, self.num_strikes, self.num_expirations)
+
+                type_features_all = []
+                for type_idx in range(self.num_types):
+                    start = type_idx * batch_size
+                    end = (type_idx + 1) * batch_size
+                    type_encoded = self.option_type_encoders[type_idx](type_data_flat[start:end])
+                    type_features_all.append(type_encoded)
+
+                combined_features = torch.cat(type_features_all, dim=1)
+                fused = self.cross_type_fusion(combined_features)
+                fused = fused + self.strike_pos_encoding + self.expiry_pos_encoding
+
+                # Strike attention
+                strike = fused.permute(0, 3, 2, 1).reshape(batch_size * self.num_expirations, self.num_strikes, 48)
+                strike_attended = self.strike_attention(strike).reshape(batch_size, self.num_expirations, self.num_strikes, 48).permute(0, 3, 2, 1)
+
+                # Expiry attention
+                expiry = fused.permute(0, 2, 3, 1).reshape(batch_size * self.num_strikes, self.num_expirations, 48)
+                expiry_attended = self.expiry_attention(expiry).reshape(batch_size, self.num_strikes, self.num_expirations, 48).permute(0, 3, 1, 2)
+
+                # Combine
+                attention_combined = torch.stack([
+                    fused, strike_attended, expiry_attended
+                ], dim=0).mean(dim=0)
+
+                weights = self.importance_weighting(attention_combined)
+                weighted = attention_combined * weights
+
+                pooled = torch.cat([
+                    pool(weighted).flatten(1) for pool in self.multi_resolution_pools
+                ], dim=1)
+
+                return self.final_fusion(pooled)
+
+        return LeanOptionChainEncoder(num_strikes, num_expirations, num_types, num_features)
+
+
+    
+    def _create_market_encoder(self, input_size: int) -> nn.Module:
+        """Create encoder for market data with backwards compatibility for checkpoint loading"""
+        # Create backwards compatible encoder that handles both 6 and 10 feature inputs
+        class BackwardsCompatibleMarketEncoder(nn.Module):
+            def __init__(self, expected_input_size):
+                super().__init__()
+                self.expected_input_size = expected_input_size
+                
+                # Create encoder expecting the current size (10 features)
+                self.encoder = nn.Sequential(
+                    nn.Linear(10, 32),  # Always expect 10 features internally
+                    nn.LayerNorm(32),
+                    nn.GELU(),
+                    nn.Dropout(0.05),
+                    nn.Linear(32, 64),
+                    nn.LayerNorm(64),
+                    GradientClipActivation()
+                )
+                
+                # Adapter layer for 6->10 feature conversion if needed
+                if expected_input_size == 6:
+                    # Create adapter to convert 6 features to 10 features
+                    self.feature_adapter = nn.Linear(6, 10)
+                    # Initialize to preserve original 6 features and zero-pad new ones
+                    with torch.no_grad():
+                        # Identity mapping for first 6 features
+                        self.feature_adapter.weight[:6, :] = torch.eye(6)
+                        self.feature_adapter.weight[6:, :] = 0.0  # Zero weights for new features
+                        self.feature_adapter.bias[:6] = 0.0
+                        self.feature_adapter.bias[6:] = 0.0  # Zero bias for new features
+                else:
+                    self.feature_adapter = None
+            
+            def forward(self, x):
+                if self.feature_adapter is not None and x.shape[-1] == 6:
+                    # Convert 6 features to 10 features
+                    x = self.feature_adapter(x)
+                elif x.shape[-1] != 10:
+                    # Pad or truncate to 10 features if needed
+                    if x.shape[-1] < 10:
+                        # Pad with zeros
+                        padding = torch.zeros(*x.shape[:-1], 10 - x.shape[-1], device=x.device)
+                        x = torch.cat([x, padding], dim=-1)
+                    else:
+                        # Truncate to 10 features
+                        x = x[..., :10]
+                
+                return self.encoder(x)
+        
+        return BackwardsCompatibleMarketEncoder(input_size)
+    def _apply_action_mask_efficient(self, logits_list, action_mask):
+        """Apply action masks efficiently with pre-computed indices - ULTRA-FAST"""
+        if action_mask is None:
+            return logits_list
+        
+        # ULTRA-FAST: Pre-compute mask indices once and cache
+        if self._mask_slice_cache is None:
+            self._mask_slice_cache = []
+            start_idx = 0
+            for logits in logits_list:
+                head_size = logits.shape[-1]
+                end_idx = start_idx + head_size
+                self._mask_slice_cache.append((start_idx, end_idx))
+                start_idx = end_idx
+        
+        # Convert action mask to proper format once
+        if isinstance(action_mask, np.ndarray):
+            if action_mask.ndim > 1 and action_mask.shape[0] == 1:
+                action_mask = action_mask.squeeze(0)
+            device = logits_list[0].device
+            action_mask = torch.as_tensor(action_mask, dtype=torch.float32, device=device)
+        elif isinstance(action_mask, torch.Tensor):
+            if action_mask.dim() > 1 and action_mask.shape[0] == 1:
+                action_mask = action_mask.squeeze(0)
+            action_mask = action_mask.float().to(logits_list[0].device)
+        
+        # ULTRA-FAST: Apply masks in-place using vectorized operations
+        masked_logits = []
+        for i, (logits, (start, end)) in enumerate(zip(logits_list, self._mask_slice_cache)):
+            if end <= action_mask.shape[-1]:
+                mask_slice = action_mask[..., start:end]
+                # ULTRA-FAST: In-place masking
+                invalid = mask_slice < 0.5
+                masked_logits_head = torch.where(invalid, torch.full_like(logits, -1e8), logits)
+                masked_logits.append(masked_logits_head)
+            else:
+                masked_logits.append(logits)
+        
+        return masked_logits
+    
+    def _create_portfolio_encoder(self, input_size: int) -> nn.Module:
+        """Create encoder for portfolio data"""
+        return nn.Sequential(
+            nn.Linear(input_size, 32),
+            nn.LayerNorm(32),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(32, 64),
+            nn.LayerNorm(64),
+            GradientClipActivation()
+        )
+    
+    def _create_basic_encoder(self, input_size: int) -> nn.Module:
+        """Create basic encoder for fallback cases"""
+        return nn.Sequential(
+            nn.Linear(input_size, 32),
+            nn.LayerNorm(32),
+            nn.GELU(),
+            nn.Linear(32, 32)
+        )
+    
+    def _create_positions_encoder(self, shape: tuple) -> nn.Module:
+        """Create encoder for positions data with attention over positions - NO FLATTENING"""
+        # shape is (max_positions, features) = (10, 8)
+        max_positions, position_features = shape
+        
+        class PositionsEncoder(nn.Module):
+            def __init__(self, position_features):
+                super().__init__()
+                # Per-position processing - preserves individual position structure
+                self.per_position = nn.Linear(position_features, 32)  # 8 -> 32 features per position
+                self.norm1 = nn.LayerNorm(32)
+                self.activation1 = nn.GELU()
+                self.dropout1 = nn.Dropout(0.1)
+                
+                # Position attention to focus on active positions while preserving position-level structure
+                self.position_attention = nn.MultiheadAttention(
+                    embed_dim=32,
+                    num_heads=4,
+                    dropout=0.1,
+                    batch_first=True
+                )
+                
+                # Position importance weighting (learn which positions matter most)
+                self.position_importance = nn.Sequential(
+                    nn.Linear(32, 16),
+                    nn.GELU(),
+                    nn.Linear(16, 1),
+                    nn.Sigmoid()
+                )
+                
+                # Final position-aware aggregation (weighted by importance, not simple mean)
+                self.final_aggregation = nn.Sequential(
+                    nn.Linear(32, 64),
+                    nn.LayerNorm(64),
+                    nn.GELU(),
+                    nn.Linear(64, 128),
+                    nn.LayerNorm(128),
+                    GradientClipActivation()
+                )
+            
+            def forward(self, x):
+                # Input: (batch, 10, 8) - positions, features
+                batch_size = x.shape[0]
+                
+                # Per-position processing - each position processed independently
+                x = self.per_position(x)  # (batch, 10, 32)
+                x = self.norm1(x)
+                x = self.activation1(x)
+                x = self.dropout1(x)
+                
+                # Position attention - positions can attend to each other
+                attended_positions, attention_weights = self.position_attention(x, x, x)  # (batch, 10, 32)
+                
+                # Calculate position importance weights
+                importance_weights = self.position_importance(attended_positions)  # (batch, 10, 1)
+                
+                # Weighted aggregation based on position importance (not simple averaging)
+                # This preserves the contribution of important positions while reducing noise from empty positions
+                weighted_positions = attended_positions * importance_weights  # (batch, 10, 32)
+                
+                # Sum weighted positions and normalize by total importance
+                total_importance = torch.sum(importance_weights, dim=1, keepdim=True) + 1e-8  # (batch, 1, 1)
+                
+                # Fix dimension mismatch: sum across positions dimension, then divide by total importance
+                position_sum = torch.sum(weighted_positions, dim=1)  # (batch, 32)
+                total_importance_squeezed = total_importance.squeeze(-1)  # (batch, 1)
+                aggregated = position_sum / total_importance_squeezed  # (batch, 32)
+                
+                # Final projection
+                output = self.final_aggregation(aggregated)  # (batch, 128)
+                
+                return output
+        
+        return PositionsEncoder(position_features)
+    
+    def _create_environment_encoder(self, input_size: int) -> nn.Module:
+        """Create encoder for environment state"""
+        return nn.Sequential(
+            nn.Linear(input_size, 16),
+            nn.LayerNorm(16),
+            nn.GELU(),
+            nn.Linear(16, 32),
+            nn.LayerNorm(32),
+            GradientClipActivation()
+        )
+    
+    def _create_generic_component_encoder(self, input_size: int) -> nn.Module:
+        """Create generic encoder for other components"""
+        return nn.Sequential(
+            nn.Linear(input_size, 32),
+            nn.LayerNorm(32),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(32, 64),
+            nn.LayerNorm(64),
+            GradientClipActivation()
+        )
+    def _create_component_fusion_network(self, component_feature_dims: dict, output_dim: int) -> nn.Module:
+        """Create network to fuse component features into final representation"""
+        total_input_dim = sum(component_feature_dims.values())  # This is 544
+        
+        # FIX: Override output_dim to match what policy_trunk expects
+        actual_output_dim = 480  # Policy trunk expects 480, not whatever was passed
+        
+        class ComponentFusionNetwork(nn.Module):
+            def __init__(self, total_input_dim, output_dim, residual_scale, component_feature_dims):
+                super().__init__()
+                self.output_dim = output_dim
+                self.component_feature_dims = component_feature_dims
+                self.expected_input_dim = total_input_dim
+                
+                self.fusion = nn.Sequential(
+                    nn.Linear(total_input_dim, 512),  # 544 -> 512
+                    LayerScale(512),
+                    nn.LayerNorm(512),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    
+                    nn.Linear(512, output_dim),  # 512 -> 480
+                    nn.LayerNorm(output_dim),
+                    GradientClipActivation()
+                )
+            
+            def forward(self, x):
+                # Debug dimension mismatch
+                if x.shape[-1] != self.expected_input_dim:
+                    worker_logger.error(f"Fusion input mismatch: expected {self.expected_input_dim}, got {x.shape[-1]}")
+                    
+                    # Emergency fix
+                    if x.shape[-1] > self.expected_input_dim:
+                        x = x[:, :self.expected_input_dim]
+                    else:
+                        padding = torch.zeros(x.shape[0], self.expected_input_dim - x.shape[-1], 
+                                            device=x.device, dtype=x.dtype)
+                        x = torch.cat([x, padding], dim=-1)
+                
+                return self.fusion(x)
+        
+        return ComponentFusionNetwork(total_input_dim, actual_output_dim, self.residual_scale, component_feature_dims)
+    
+    def _init_weights_manually(self):
+        """Manually initialize weights to avoid recursion issues"""
+        # Initialize encoder weights
+        for module in [self.qf_encoder, self.qf_twin_encoder]:
+            for layer in module.modules():
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight, gain=0.25)
+                    if layer.bias is not None:
+                        nn.init.constant_(layer.bias, 0.0)
+                elif isinstance(layer, nn.LayerNorm):
+                    nn.init.constant_(layer.bias, 0.0)
+                    nn.init.constant_(layer.weight, 1.0)
+        
+        # Initialize Q-function weights
+        for module in [self.qf, self.qf_twin]:
+            for layer in module.modules():
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight, gain=0.25)
+                    if layer.bias is not None:
+                        nn.init.constant_(layer.bias, 0.0)
+                elif isinstance(layer, nn.LayerNorm):
+                    nn.init.constant_(layer.bias, 0.0)
+                    nn.init.constant_(layer.weight, 1.0)
+    
+    def _register_gradient_hooks(self):
+        """Register gradient clipping hooks on key parameters"""
+        def clip_grad_hook(grad):
+            return torch.clamp(grad, -self.gradient_clip_norm, self.gradient_clip_norm)
+        
+        # Apply to timing head
+        for param in self.timing_head.parameters():
+            if param.requires_grad:
+                param.register_hook(clip_grad_hook)
+        
+        # Apply to parameter heads
+        for head in self.parameter_heads.values():
+            for param in head.parameters():
+                if param.requires_grad:
+                    param.register_hook(clip_grad_hook)
+        
+        # Apply to Q-functions
+        for param in self.qf.parameters():
+            if param.requires_grad:
+                param.register_hook(clip_grad_hook)
+        
+        for param in self.qf_twin.parameters():
+            if param.requires_grad:
+                param.register_hook(clip_grad_hook)
+    
+    def _normalize_input(self, obs):
+        """Robust input normalization for option chain observations"""
+        # Handle potential NaN/inf values
+        obs_clean = torch.where(torch.isnan(obs), torch.zeros_like(obs), obs)
+        obs_clean = torch.where(torch.isinf(obs_clean), torch.sign(obs_clean) * 10.0, obs_clean)
+        
+        # Robust standardization using median and MAD (more stable than mean/std)
+        obs_median = torch.median(obs_clean, dim=-1, keepdim=True)[0]
+        obs_mad = torch.median(torch.abs(obs_clean - obs_median), dim=-1, keepdim=True)[0]
+        
+        # Normalize using median and MAD
+        obs_norm = (obs_clean - obs_median) / (obs_mad + 1e-6)
+        
+        # Apply conservative clipping to prevent extreme values
+        return torch.clamp(obs_norm, -3.0, 3.0)
+    
+    def _process_structured_obs_for_encoding(self, obs_dict):
+        """Process structured observation dict while preserving structure for neural network input"""
+        if isinstance(obs_dict, dict):
+            # Use the HybridPolicyNetwork's processing method
+            return self.pi._process_structured_obs(obs_dict)
+        else:
+            # Already processed or non-dict observation
+            return obs_dict
+    def _encode_obs(self, obs):
+        """Encode observations with gradient stability - fixed cache keys"""
+        # Use content-based cache key instead of id()
+        if isinstance(obs, dict):
+            # Create hash based on tensor contents, not object id
+            cache_key = self._create_content_hash(obs)
+        else:
+            cache_key = hash(tuple(obs.flatten().detach().cpu().numpy())) if isinstance(obs, torch.Tensor) else str(obs)
+        
+        if cache_key not in self._encoder_cache:
+            # Process and cache
+            if isinstance(obs, dict) and hasattr(self, 'component_encoders') and self.component_encoders:
+                obs_processed = self.pi._process_structured_obs_with_components(obs)
+            elif isinstance(obs, dict):
+                obs_processed = self._process_structured_obs_for_encoding(obs)
+            else:
+                obs_processed = obs
+            
+            # Store detached version to prevent gradient accumulation
+            if isinstance(obs_processed, torch.Tensor):
+                self._encoder_cache[cache_key] = obs_processed.detach()
+            else:
+                self._encoder_cache[cache_key] = obs_processed
+        
+        features = self._encoder_cache[cache_key]
+        
+        # Apply feature scaling
+        if isinstance(features, torch.Tensor):
+            return features * self.feature_scale
+        else:
+            return features
+    def _forward_shared(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """Shared forward pass with hybrid action handling - ULTRA-FAST VERSION"""
+        obs_data = batch["obs"]
+        
+        # Handle case where obs_data might be a tuple or other structure
+        if isinstance(obs_data, tuple):
+            obs_dict = obs_data[0] if len(obs_data) > 0 else {}
+        else:
+            obs_dict = obs_data
+        
+        # ULTRA-FAST: Cache observation encoding
+        obs_key = id(obs_dict)
+        if obs_key not in self._encoder_cache:
+            # Handle structured observations - preserve structure throughout
+            if isinstance(obs_dict, dict):
+                observations = obs_dict
+                action_mask = obs_dict.get("action_mask")
+            else:
+                observations = obs_dict
+                action_mask = None
+            
+            # Encode observations (handles structured observations without flattening)
+            policy_features = self._encode_obs(observations)
+            self._encoder_cache[obs_key] = (policy_features, action_mask)
+        else:
+            policy_features, action_mask = self._encoder_cache[obs_key]
+        
+        trunk_features = self.policy_trunk(policy_features)
+        
+        # ULTRA-FAST: Batch compute all heads in parallel
+        head_outputs = self._compute_all_heads_batch(trunk_features)
+        
+        # Apply action masking efficiently
+        if action_mask is not None:
+            head_outputs = self._apply_action_mask_efficient(head_outputs, action_mask)
+        
+        # Compute value function
+        vf_preds = self.value_head(policy_features).squeeze(-1)
+        
+        return {
+            "action_dist_inputs": torch.cat(head_outputs, dim=-1),
+            "vf_preds": vf_preds,
+        }
+    def _setup_cuda_streams(self):
+        """Setup CUDA streams for parallel processing"""
+        # Check if CUDA is available AND if we're actually on a CUDA device
+        if torch.cuda.is_available() and torch.cuda.current_device() >= 0:
+            try:
+                # Force CUDA initialization in this worker
+                torch.cuda.init()
+                
+                # Check if any model parameters are on CUDA
+                model_on_cuda = any(p.is_cuda for p in self.parameters())
+                
+                if model_on_cuda:
+                    self.q_stream = torch.cuda.Stream()
+                    self.q_twin_stream = torch.cuda.Stream()
+                    self.encoder_stream = torch.cuda.Stream()
+                    self.policy_stream = torch.cuda.Stream()
+                    
+                    worker_logger.warning(f"CUDA streams initialized on device {torch.cuda.current_device()}", 
+                                        extra={'worker_id': get_ray_worker_id()})
+                else:
+                    worker_logger.warning("Model not on CUDA, streams set to None", 
+                                        extra={'worker_id': get_ray_worker_id()})
+                    self._set_streams_to_none()
+            except Exception as e:
+                worker_logger.warning(f"CUDA stream setup failed: {e}, falling back to CPU", 
+                                    extra={'worker_id': get_ray_worker_id()})
+                self._set_streams_to_none()
+        else:
+            worker_logger.warning("CUDA not available or no device set, streams set to None", 
+                                extra={'worker_id': get_ray_worker_id()})
+            self._set_streams_to_none()
+
+    def _set_streams_to_none(self):
+        """Helper to set all streams to None"""
+        self.q_stream = None
+        self.q_twin_stream = None
+        self.encoder_stream = None
+        self.policy_stream = None
+    def _compute_q_values_stream(self, obs_batch, action_batch):
+        """Q-value computation with parallel processing and memory-efficient caching"""
+        
+        # DEBUG: Check input tensor versions
+        obs_version = getattr(obs_batch, '_version', 0)
+        action_version = getattr(action_batch, '_version', 0)
+        
+        if obs_version > 20 or action_version > 20:
+            worker_logger.warning(f"High version tensors in Q-compute: obs={obs_version}, action={action_version}")
+            
+            # FIX: Create fresh tensors if versions are too high
+            if obs_version > 25:
+                obs_batch = obs_batch.detach().requires_grad_(True)
+                worker_logger.warning("Detached high-version obs tensor")
+            if action_version > 25:
+                action_batch = action_batch.detach().requires_grad_(True)
+                worker_logger.warning("Detached high-version action tensor")
+        
+        # Periodic cache cleanup to prevent memory accumulation
+        if len(self._q_input_cache) > 50:
+            keys_to_remove = list(self._q_input_cache.keys())[:int(len(self._q_input_cache) * 0.75)]
+            for key in keys_to_remove:
+                self._q_input_cache.pop(key, None)
+            
+            worker_logger.warning(
+                f"Q-input cache exceeded 50 entries, removed {len(keys_to_remove)} entries",
+                extra={'worker_id': get_ray_worker_id()}
+            )
+        
+        # Use tensor hashes for cache key
+        cache_key = (
+            obs_batch.shape,
+            action_batch.shape,
+            obs_batch.device,
+            action_batch.device,
+            hash(str(obs_batch.flatten()[:10].detach().cpu().numpy().tolist())),
+            hash(str(action_batch.flatten()[:5].detach().cpu().numpy().tolist()))
+        )
+        
+        # Check cache first
+        if cache_key in self._q_input_cache:
+            cached_result = self._q_input_cache[cache_key]
+            if cached_result[0].requires_grad:
+                worker_logger.warning("Cached tensor has gradients - creating fresh copy")
+            return (cached_result[0].detach().requires_grad_(True), 
+                    cached_result[1].detach().requires_grad_(True))
+        
+        # Use parallel Q-value computation
+        q1_val, q2_val = self._compute_q_values_parallel_internal(obs_batch, action_batch)
+        
+        # DEBUG: Check output versions
+        q1_version = getattr(q1_val, '_version', 0)
+        q2_version = getattr(q2_val, '_version', 0)
+        
+        if q1_version > obs_version + 10 or q2_version > obs_version + 10:
+            worker_logger.warning(f"Large version jump in Q-values: input={obs_version} -> q1={q1_version}, q2={q2_version}")
+        
+        # Store completely detached and cloned results
+        result = (q1_val.detach().clone(), q2_val.detach().clone())
+        self._q_input_cache[cache_key] = result
+        
+        return (q1_val, q2_val)
+
+    # 2. ADD _compute_q_values_parallel_internal function
+    def _compute_q_values_parallel_internal(self, obs_batch, action_batch):
+        """Internal parallel Q-value computation"""
+        # Ensure concatenation doesn't share memory
+        obs_action_concat = torch.cat([obs_batch.clone(), action_batch.clone()], dim=-1)
+        
+        # Split batch across workers if batch is large enough
+        batch_size = obs_action_concat.shape[0]
+        
+        if batch_size >= self.parallel_workers * 4:  # Only parallelize if batch is large enough
+            return self._compute_q_values_batch_parallel(obs_action_concat)
+        else:
+            # Use standard computation for small batches
+            return self._compute_q_values_standard(obs_action_concat)
+
+    # 3. ADD _compute_q_values_batch_parallel function
+    def _compute_q_values_batch_parallel(self, obs_action_concat):
+        """Compute Q-values by splitting batch across CPU cores"""
+        batch_size = obs_action_concat.shape[0]
+        
+        # Split batch into chunks for parallel processing
+        chunk_size = max(1, batch_size // self.parallel_workers)
+        batch_chunks = [obs_action_concat[i:i + chunk_size] for i in range(0, batch_size, chunk_size)]
+        
+        def compute_q_chunk(chunk):
+            """Compute Q-values for a chunk of the batch"""
+            # Q1 computation
+            q1_features = self.qf_encoder(chunk)
+            q1_val = self.qf(q1_features).squeeze(-1)
+            
+            # Q2 computation
+            q2_features = self.qf_twin_encoder(chunk)
+            q2_val = self.qf_twin(q2_features).squeeze(-1)
+            
+            return q1_val, q2_val
+        
+        # Execute chunks in parallel
+        futures = []
+        with ThreadPoolExecutor(max_workers=len(batch_chunks)) as executor:
+            for chunk in batch_chunks:
+                future = executor.submit(compute_q_chunk, chunk)
+                futures.append(future)
+            
+            # Collect results
+            q1_results = []
+            q2_results = []
+            for future in futures:
+                q1_chunk, q2_chunk = future.result()
+                q1_results.append(q1_chunk)
+                q2_results.append(q2_chunk)
+        
+        # Concatenate results
+        q1_val = torch.cat(q1_results, dim=0)
+        q2_val = torch.cat(q2_results, dim=0)
+        
+        return q1_val, q2_val
+
+    # 4. ADD _compute_q_values_standard function
+    def _compute_q_values_standard(self, obs_action_concat):
+        """Standard Q-value computation with optional CUDA streams"""
+        if hasattr(self, 'q_stream') and self.q_stream is not None:
+            with torch.cuda.stream(self.q_stream):
+                q1_features = self.qf_encoder(obs_action_concat)
+                
+            with torch.cuda.stream(self.q_twin_stream):
+                q2_features = self.qf_twin_encoder(obs_action_concat)
+            
+            torch.cuda.synchronize()
+        else:
+            q1_features = self.qf_encoder(obs_action_concat)
+            q2_features = self.qf_twin_encoder(obs_action_concat)
+        
+        q1_val = self.qf(q1_features).squeeze(-1)
+        q2_val = self.qf_twin(q2_features).squeeze(-1)
+        
+        return q1_val, q2_val
+
+    # 5. ADD _compute_multiple_q_values_parallel function
+    def _compute_multiple_q_values_parallel(self, obs_action_pairs):
+        """Compute Q-values for multiple obs/action pairs in parallel"""
+        if len(obs_action_pairs) == 1:
+            obs_batch, action_batch = obs_action_pairs[0]
+            return [self._compute_q_values_stream(obs_batch, action_batch)]
+        
+        def compute_single_q(obs_action_pair):
+            obs_batch, action_batch = obs_action_pair
+            return self._compute_q_values_stream(obs_batch, action_batch)
+        
+        # Execute multiple Q-computations in parallel
+        futures = []
+        max_workers = min(len(obs_action_pairs), self.parallel_workers)
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for pair in obs_action_pairs:
+                future = executor.submit(compute_single_q, pair)
+                futures.append(future)
+            
+            # Collect results
+            results = []
+            for future in futures:
+                result = future.result()
+                results.append(result)
+        
+        return results
+
+    def _compute_timing_baseline_parallel(self, observations, actions, action_probs):
+        """Parallel timing baseline computation across CPU cores"""
+        device = observations.device
+        batch_size = observations.shape[0]
+        timing_baseline = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        
+        # Split timing actions across workers
+        timing_actions = list(range(self.timing_action_size))
+        chunk_size = max(1, len(timing_actions) // self.parallel_workers)
+        timing_chunks = [timing_actions[i:i + chunk_size] for i in range(0, len(timing_actions), chunk_size)]
+        
+        def process_timing_chunk(timing_chunk):
+            chunk_baseline = torch.zeros(batch_size, dtype=torch.float32, device=device)
+            for timing_action in timing_chunk:
+                action_vector = actions.clone()
+                action_vector[:, 0] = timing_action
+                action_concat = _batch_one_hot_encode_fast(action_vector, self.action_component_sizes)
+                q1_val, _ = self._compute_q_values_stream(observations, action_concat)
+                chunk_baseline = chunk_baseline + action_probs[0][:, timing_action] * q1_val
+            return chunk_baseline
+        
+        # Execute in parallel
+        with ThreadPoolExecutor(max_workers=len(timing_chunks)) as executor:
+            futures = [executor.submit(process_timing_chunk, chunk) for chunk in timing_chunks]
+            results = [future.result() for future in futures]
+        
+        return sum(results)
+    def _compute_action_probs_batch(self, trunk_features):
+        """Compute all action probabilities in batch - ULTRA-FAST"""
+        action_probs = []
+        
+        # Timing head
+        timing_logits = self.timing_head(trunk_features)
+        timing_probs = F.softmax(timing_logits, dim=-1)
+        action_probs.append(timing_probs)
+        
+        # Parameter heads - batch compute
+        for param_config in self.parameter_configs:
+            param_name = param_config['name']
+            param_logits = self.parameter_heads[param_name](trunk_features)
+            if param_config['type'] == 'discrete':
+                param_probs = F.softmax(param_logits, dim=-1)
+            else:
+                # For continuous parameters, create dummy probability tensor
+                param_probs = torch.ones(param_logits.shape[0], 1, device=param_logits.device)
+            action_probs.append(param_probs)
+        
+        return action_probs
+
+
+    def _compute_all_heads_batch(self, trunk_features):
+        """Compute all policy heads in parallel - ULTRA-FAST"""
+        # ULTRA-FAST: Pre-allocate output list
+        head_outputs = [None] * (1 + len(self.parameter_configs))
+        
+        # Conditional learning check
+        if self.enable_conditional_learning:
+            # Get position state once
+            has_open_position = hasattr(self, '_current_position_state') and self._current_position_state
+            
+            if has_open_position:
+                # Timing gets full gradients
+                head_outputs[0] = self.timing_head(trunk_features)
+                
+                # Parameters get scaled gradients
+                for i, param_config in enumerate(self.parameter_configs):
+                    param_name = param_config['name']
+                    param_output = self.parameter_heads[param_name](trunk_features)
+                    param_output = self._apply_conditional_gradient_scaling(
+                        param_output, self.parameter_detach_strength
+                    )
+                    head_outputs[i + 1] = param_output
+            else:
+                # Both policies learn normally
+                head_outputs[0] = self.timing_head(trunk_features)
+                
+                for i, param_config in enumerate(self.parameter_configs):
+                    param_name = param_config['name']
+                    head_outputs[i + 1] = self.parameter_heads[param_name](trunk_features)
+        else:
+            # No conditional learning
+            head_outputs[0] = self.timing_head(trunk_features)
+            
+            for i, param_config in enumerate(self.parameter_configs):
+                param_name = param_config['name']
+                head_outputs[i + 1] = self.parameter_heads[param_name](trunk_features)
+        
+        return head_outputs
+
+    @override(ValueFunctionAPI)
+    def compute_values(self, batch, **kwargs):
+        """Compute value function predictions with gradient stability - handles structured observations"""
+        obs_dict = batch["obs"]
+        
+        # Handle structured observations without flattening
+        observations = obs_dict
+        
+        feats = self._encode_obs(observations)
+        values = self.value_head(feats).squeeze(-1)
+        return torch.clamp(values, min=-100.0, max=100.0)
+    
+    def _forward_inference(self, batch: Dict[str, Any], **kwargs):
+        return self._forward_shared(batch)
+    
+    def _forward_exploration(self, batch: Dict[str, Any], **kwargs):
+        return self._forward_shared(batch)
+    def clear_caches(self):
+        """Clear all internal caches to free memory"""
+        self._encoder_cache.clear()
+        self._component_batch_cache.clear()
+        self._q_input_cache.clear()
+        self._attention_cache.clear()
+        # Don't clear tensor pool as it's for reuse
+
+    def _ensure_device_efficient(self, tensors, target_device):
+        """Batch device transfers - ULTRA-FAST"""
+        return [t.to(target_device, non_blocking=True) if t.device != target_device else t for t in tensors]
+    def _compute_baselines_vectorized(self, obs_dict, actions, structure_learns):
+        """Compute counterfactual baselines with parallel processing"""
+        observations = self._process_structured_obs_for_encoding(obs_dict)
+        
+        if not isinstance(observations, torch.Tensor):
+            observations = torch.as_tensor(observations, dtype=torch.float32)
+        
+        device = observations.device
+        batch_size = actions.shape[0]
+        
+        # Get policy features once
+        policy_features = self._encode_obs(obs_dict)
+        trunk_features = self.policy_trunk(policy_features)
+        action_probs = self._compute_action_probs_batch(trunk_features)
+        
+        # Parallel timing baseline
+        timing_baseline = self._compute_timing_baseline_parallel(observations, actions, action_probs)
+        
+        # Structure baseline for OPEN actions
+        structure_baseline = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        if structure_learns.any():
+            open_indices = torch.nonzero(structure_learns, as_tuple=True)[0]
+            if open_indices.numel() > 0:
+                structure_baseline_open = self._compute_structure_baseline_parallel(
+                    observations[open_indices], actions[open_indices], 
+                    [probs[open_indices] for probs in action_probs]
+                )
+                structure_baseline = structure_baseline.index_copy(0, open_indices, structure_baseline_open)
+        
+        return timing_baseline, structure_baseline
+    def _compute_structure_baseline_parallel(self, observations, actions, action_probs):
+        """Parallel structure baseline computation"""
+        device = observations.device
+        batch_size = observations.shape[0]
+        structure_baseline = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        
+        def process_structure_head(head_idx):
+            component_baseline = torch.zeros(batch_size, dtype=torch.float32, device=device)
+            action_size = self.action_component_sizes[head_idx]
+            
+            for action_val in range(action_size):
+                action_vector = actions.clone()
+                action_vector[:, head_idx] = action_val
+                action_concat = _batch_one_hot_encode_fast(action_vector, self.action_component_sizes)
+                q1_val, _ = self._compute_q_values_stream(observations, action_concat)
+                component_baseline = component_baseline + action_probs[head_idx][:, action_val] * q1_val
+            
+            return component_baseline
+        
+        # Process structure heads in parallel
+        structure_head_indices = list(range(1, len(self.action_component_sizes)))
+        with ThreadPoolExecutor(max_workers=min(len(structure_head_indices), self.parallel_workers)) as executor:
+            futures = [executor.submit(process_structure_head, head_idx) for head_idx in structure_head_indices]
+            results = [future.result() for future in futures]
+        
+        if results:
+            structure_baseline = sum(results) / len(results)
+        
+        return structure_baseline    
+    def _forward_train_core(self, batch: Dict[str, Any], **kwargs):
+        """Training forward pass with selective gradient computation - OPTIMIZED VERSION PRESERVING ALL LOGIC"""
+        
+        # OPTIMIZATION: Check tensor versions for debugging - EXACT SAME LOGIC
+        if self.debug_tensor_versions_comprehensive():
+            worker_logger.error("HIGH VERSIONS DETECTED - CLEARING ALL CACHES")
+            self.clear_episode_caches()
+        
+        # Use optimized shared forward pass - EXACT SAME LOGIC
+        res = self._forward_shared(batch)
+        
+        obs_data = batch["obs"]
+        
+        # Handle case where obs_data might be a tuple or other structure - EXACT SAME
+        if isinstance(obs_data, tuple):
+            obs_dict = obs_data[0] if len(obs_data) > 0 else {}
+        else:
+            obs_dict = obs_data
+
+        # Handle structured observations - preserve structure for gradient computation - EXACT SAME
+        if isinstance(obs_dict, dict):
+            observations = obs_dict
+        else:
+            observations = obs_dict
+
+        # OPTIMIZATION: Process observations for Q-function input while preserving gradients
+        obs_cache_key = f"train_{self._create_content_hash(observations)}"
+        if obs_cache_key not in self._encoder_cache:
+            if isinstance(observations, dict) and hasattr(self, 'component_encoders') and self.component_encoders:
+                observations_processed = self.pi._process_structured_obs_with_components(observations)
+                observations_processed = observations_processed.detach()
+                observations_processed.requires_grad_(True)
+            elif isinstance(observations, dict):
+                observations_processed = self._process_structured_obs_for_encoding(observations)
+                observations_processed = observations_processed.detach()
+                observations_processed.requires_grad_(True)
+            else:
+                observations = observations.detach()
+                observations.requires_grad_(True)
+                observations_processed = observations
+            
+            self._encoder_cache[obs_cache_key] = observations_processed
+        else:
+            observations_processed = self._encoder_cache[obs_cache_key]
+
+        actions = batch["actions"]
+
+        # Extract timing and structure actions - EXACT SAME
+        timing_actions = actions[:, 0]  # OPEN=0, HOLD=1, CLOSE=2
+        structure_actions = actions[:, 1:]
+
+        # Create masks for which policies should learn - EXACT SAME
+        timing_learns = torch.ones_like(timing_actions, dtype=torch.bool)  # Always learns
+        structure_learns = (timing_actions == 0)  # Only learn when OPEN action
+
+        # OPTIMIZATION: Use JIT compiled one-hot encoding
+        self.debug_action_space(actions)
+        act_concat = _batch_one_hot_encode_fast_jit(actions, self.action_component_sizes)
+
+        # Q-values for taken actions using batch computation - EXACT SAME LOGIC
+        q1_val, q2_val = self._compute_q_values_stream(observations_processed, act_concat)
+
+        # Counterfactual baselines using vectorized computation - EXACT SAME LOGIC
+        timing_baseline, structure_baseline = self._compute_baselines_vectorized(
+            obs_dict, actions, structure_learns
+        )
+
+        timing_advantage = q1_val - timing_baseline
+        structure_advantage = torch.where(
+            structure_learns,
+            q1_val - structure_baseline,
+            torch.zeros_like(q1_val).detach()
+        )
+
+        # Resample actions from current policy using cached features - EXACT SAME LOGIC
+        policy_cache_key = f"policy_{self._create_content_hash(observations)}"
+        if policy_cache_key not in self._encoder_cache:
+            policy_feats = self._encode_obs(observations)
+            trunk_feats = self.policy_trunk(policy_feats)
+            self._encoder_cache[policy_cache_key] = trunk_feats
+        else:
+            trunk_feats = self._encoder_cache[policy_cache_key]
+        
+        # Batch create all logits - EXACT SAME
+        all_logits = self._compute_all_heads_batch(trunk_feats)
+        
+        # Apply masking efficiently before distribution creation - EXACT SAME
+        action_mask = obs_dict.get("action_mask") if isinstance(obs_dict, dict) else None
+        if action_mask is not None:
+            all_logits = self._apply_action_mask_efficient(all_logits, action_mask)
+
+        # Create distribution from properly masked logits - EXACT SAME
+        policy_dist = self.get_train_action_dist_cls().from_logits(
+            torch.cat(all_logits, dim=-1), input_lens=self.action_component_sizes
+        )
+        resampled = policy_dist.sample()
+        logp_res = policy_dist.logp(resampled)
+
+        # OPTIMIZATION: Use JIT compiled one-hot encoding
+        res_concat = _batch_one_hot_encode_fast_jit(resampled, self.action_component_sizes)
+        
+        # Use batch Q-value computation - EXACT SAME
+        q_curr, q_curr_twin = self._compute_q_values_stream(observations_processed, res_concat)
+
+        # Next state target Q-values - optimized - EXACT SAME LOGIC
+        q_target_next = torch.zeros_like(q1_val)
+        q_target_next_twin = torch.zeros_like(q2_val)
+        logp_next_res = torch.zeros_like(logp_res)
+
+        if "obs_next" in batch:
+            next_obs_data = batch["obs_next"]
+            
+            # Handle case where next_obs_data might be a tuple or other structure - EXACT SAME
+            if isinstance(next_obs_data, tuple):
+                next_obs_dict = next_obs_data[0] if len(next_obs_data) > 0 else {}
+            else:
+                next_obs_dict = next_obs_data
+            
+            # Handle structured next observations - preserve structure - EXACT SAME
+            if isinstance(next_obs_dict, dict):
+                next_obs = next_obs_dict
+            else:
+                next_obs = next_obs_dict
+            
+            # Cache next observation processing - EXACT SAME LOGIC
+            next_obs_key = f"next_{self._create_content_hash(next_obs)}"
+            if next_obs_key not in self._encoder_cache:
+                next_feats = self._encode_obs(next_obs)
+                next_trunk_feats = self.policy_trunk(next_feats)
+                self._encoder_cache[next_obs_key] = next_trunk_feats
+            else:
+                next_trunk_feats = self._encoder_cache[next_obs_key]
+            
+            # Batch create next logits - EXACT SAME
+            next_logits = self._compute_all_heads_batch(next_trunk_feats)
+            
+            next_mask = next_obs_dict.get("action_mask") if isinstance(next_obs_dict, dict) else None
+            if next_mask is not None:
+                next_logits = self._apply_action_mask_efficient(next_logits, next_mask)
+
+            next_dist = self.get_train_action_dist_cls().from_logits(
+                torch.cat(next_logits, dim=-1), input_lens=self.action_component_sizes
+            )
+            next_act = next_dist.sample()
+            logp_next_res = next_dist.logp(next_act)
+
+            # OPTIMIZATION: Use JIT compiled one-hot encoding
+            next_concat = _batch_one_hot_encode_fast_jit(next_act, self.action_component_sizes)
+            
+            # Process next observations for Q-value computation
+            next_obs_processed = self._process_structured_obs_for_encoding(next_obs) if isinstance(next_obs, dict) else next_obs
+            next_q_in = torch.cat([next_obs_processed, next_concat], dim=-1)
+
+            with torch.no_grad():
+                next_q_feat1 = self.qf_target_encoder(next_q_in)
+                next_q_feat2 = self.qf_twin_target_encoder(next_q_in)
+                q_target_next = self.qf_target(next_q_feat1).squeeze(-1)
+                q_target_next_twin = self.qf_twin_target(next_q_feat2).squeeze(-1)
+
+        res.update({
+            "qf_preds": self._stabilize_values(q1_val, "qf_preds"),
+            "qf_twin_preds": self._stabilize_values(q2_val, "qf_twin_preds"),
+            "q_curr": self._stabilize_values(q_curr, "q_curr"),
+            "q_curr_twin": self._stabilize_values(q_curr_twin, "q_curr_twin"),
+            "q_target_next": q_target_next.detach(),
+            "q_target_next_twin": q_target_next_twin.detach(),
+            "logp_resampled": self._stabilize_values(logp_res, "logp_resampled"),
+            "logp_next_resampled": self._stabilize_values(logp_next_res, "logp_next_resampled"),
+            "timing_advantage": self._stabilize_values(timing_advantage, "timing_advantage"),
+            "structure_advantage": self._stabilize_values(structure_advantage, "structure_advantage"),
+            "timing_learns": timing_learns,
+            "structure_learns": structure_learns,
+        })
+
+        return res
+
+    def debug_tensor_versions_comprehensive(self):
+        """Comprehensive tensor version debugging"""
+        high_version_items = []
+        
+        # Check all parameters
+        for name, param in self.named_parameters():
+            if hasattr(param, '_version') and param._version > 10:
+                high_version_items.append(f"PARAM {name}: {param._version}")
+        
+        # Check all buffers  
+        for name, buffer in self.named_buffers():
+            if buffer is not None and hasattr(buffer, '_version') and buffer._version > 10:
+                high_version_items.append(f"BUFFER {name}: {buffer._version}")
+        
+        # Check cached tensors
+        for cache_name, cache in [('encoder', self._encoder_cache), 
+                                ('q_input', self._q_input_cache),
+                                ('attention', self._attention_cache)]:
+            for key, value in cache.items():
+                if isinstance(value, torch.Tensor) and hasattr(value, '_version') and value._version > 10:
+                    high_version_items.append(f"CACHE {cache_name}[{key}]: {value._version}")
+                elif isinstance(value, (tuple, list)):
+                    for i, item in enumerate(value):
+                        if isinstance(item, torch.Tensor) and hasattr(item, '_version') and item._version > 10:
+                            high_version_items.append(f"CACHE {cache_name}[{key}][{i}]: {item._version}")
+        
+        if high_version_items:
+            worker_logger.error(f"HIGH VERSION TENSORS DETECTED:\n" + "\n".join(high_version_items))
+            return True
+        return False
+
+    def _stabilize_values(self, tensor, name=""):
+        """Stabilize tensor values to prevent numerical issues while preserving gradients"""
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            worker_logger.warning(f"Found NaN/Inf in {name}, replacing with zeros", extra={'worker_id': get_ray_worker_id()})
+            # Preserve gradient tracking when replacing NaN/Inf
+            if tensor.requires_grad:
+                tensor = torch.where(
+                    torch.isnan(tensor) | torch.isinf(tensor),
+                    torch.zeros_like(tensor),
+                    tensor
+                )
+            else:
+                tensor = torch.nan_to_num(tensor, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # Clamp to reasonable bounds while preserving gradients
+        tensor = torch.clamp(tensor, min=-100.0, max=100.0)
+        return tensor
+        
+    # ADD THESE NEW METHODS HERE:
+    def _setup_enhanced_mixed_precision(self):
+        """Enhanced mixed precision with dynamic loss scaling"""
+        if not torch.cuda.is_available():
+            return  # Skip if no CUDA
+            
+        self.scaler = torch.cuda.amp.GradScaler(
+            init_scale=2**16,
+            growth_factor=2.0,
+            backoff_factor=0.5,
+            growth_interval=2000
+        )
+        
+        # Convert heavy computation layers to fp16
+        for name, module in self.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)) and any(x in name for x in ['encoder', 'fusion']):
+                module.half()
+        
+        worker_logger.warning("Enhanced mixed precision training enabled", 
+                            extra={'worker_id': get_ray_worker_id()})
+    def _forward_train(self, batch: Dict[str, Any], **kwargs):
+        """Training forward pass with AMP support"""
+        if hasattr(self, 'scaler'):
+            with torch.cuda.amp.autocast():
+                return self._forward_train_core(batch, **kwargs)
+        else:
+            return self._forward_train_core(batch, **kwargs)
+    @override(TorchRLModule)
+    def get_train_action_dist_cls(self):
+        # Create hybrid distribution for discrete timing + continuous/discrete parameters
+        timing_size = self.timing_action_size
+        parameter_configs = self.parameter_configs
+        
+        class HybridActionDistribution:
+            def __init__(self, inputs=None, input_lens=None, model=None):
+                self.inputs = inputs
+                self.timing_size = timing_size
+                self.parameter_configs = parameter_configs
+                
+                if inputs is not None:
+                    self._parse_inputs(inputs)
+            
+            def _parse_inputs(self, inputs):
+                """Parse the concatenated inputs into timing and parameter components"""
+                # Timing logits (discrete)
+                self.timing_logits = inputs[..., :self.timing_size]
+                
+                # Parameter inputs (mixed continuous/discrete)
+                self.parameter_inputs = []
+                start_idx = self.timing_size
+                
+                for param_config in self.parameter_configs:
+                    if param_config['type'] == 'continuous':
+                        # Continuous parameter: mean and log_std
+                        end_idx = start_idx + 2
+                        param_input = inputs[..., start_idx:end_idx]
+                        self.parameter_inputs.append(param_input)
+                        start_idx = end_idx
+                    else:
+                        # Discrete parameter: logits
+                        param_size = param_config['n']
+                        end_idx = start_idx + param_size
+                        param_input = inputs[..., start_idx:end_idx]
+                        self.parameter_inputs.append(param_input)
+                        start_idx = end_idx
+            
+            @classmethod
+            def from_logits(cls, logits, input_lens=None, model=None):
+                return cls(inputs=logits, input_lens=input_lens, model=model)
+            
+            def sample(self):
+                """Sample from hybrid distribution WITHOUT clipping"""
+                samples = []
+                
+                # Sample timing action (discrete)
+                timing_dist = torch.distributions.Categorical(logits=self.timing_logits)
+                timing_sample = timing_dist.sample()
+                samples.append(timing_sample)
+                
+                # Sample parameter actions (mixed continuous/discrete)
+                for i, param_config in enumerate(self.parameter_configs):
+                    param_input = self.parameter_inputs[i]
+                    
+                    if param_config['type'] == 'continuous':
+                        # Use the raw mean and log_std outputs directly
+                        mean = param_input[..., 0]
+                        log_std = param_input[..., 1]
+                        std = torch.exp(log_std)  # No clipping on std either
+                        
+                        # Sample from unbounded normal
+                        raw_sample = torch.distributions.Normal(mean, std).sample()
+                        
+                        # Transform to bounds using sigmoid (differentiable)
+                        low, high = param_config['low'], param_config['high']
+                        # Sigmoid maps (-inf, inf) to (0, 1), then scale to (low, high)
+                        bounded_sample = low + torch.sigmoid(raw_sample) * (high - low)
+                        
+                        samples.append(bounded_sample)
+                    else:
+                        # Discrete parameter: sample from Categorical distribution
+                        param_dist = torch.distributions.Categorical(logits=param_input)
+                        param_sample = param_dist.sample().float()
+                        samples.append(param_sample)
+                
+                return torch.stack(samples, dim=-1)
+                        
+            def logp(self, actions):
+                """Compute log probability for hybrid actions"""
+                log_probs = []
+                
+                # Timing action log probability (discrete)
+                timing_dist = torch.distributions.Categorical(logits=self.timing_logits)
+                timing_action = actions[..., 0].long()
+                timing_logp = timing_dist.log_prob(timing_action)
+                log_probs.append(timing_logp)
+                
+                # Parameter action log probabilities (mixed continuous/discrete)
+                for i, param_config in enumerate(self.parameter_configs):
+                    param_input = self.parameter_inputs[i]
+                    param_action = actions[..., i + 1]  # +1 because timing is at index 0
+                    
+                    if param_config['type'] == 'continuous':
+                        # Continuous parameter: Normal distribution log probability
+                        mean = param_input[..., 0]
+                        log_std = param_input[..., 1]
+                        std = torch.exp(torch.clamp(log_std, min=-20, max=2))
+                        
+                        param_dist = torch.distributions.Normal(mean, std)
+                        param_logp = param_dist.log_prob(param_action)
+                    else:
+                        # Discrete parameter: Categorical distribution log probability
+                        param_dist = torch.distributions.Categorical(logits=param_input)
+                        param_action_int = param_action.long()
+                        param_logp = param_dist.log_prob(param_action_int)
+                    
+                    log_probs.append(param_logp)
+                
+                return torch.stack(log_probs, dim=-1).sum(dim=-1)
+            
+            def entropy(self):
+                """Compute entropy for hybrid distribution"""
+                entropies = []
+                
+                # Timing action entropy (discrete)
+                timing_dist = torch.distributions.Categorical(logits=self.timing_logits)
+                timing_entropy = timing_dist.entropy()
+                entropies.append(timing_entropy)
+                
+                # Parameter action entropies (mixed continuous/discrete)
+                for i, param_config in enumerate(self.parameter_configs):
+                    param_input = self.parameter_inputs[i]
+                    
+                    if param_config['type'] == 'continuous':
+                        # Continuous parameter: Normal distribution entropy
+                        log_std = param_input[..., 1]
+                        std = torch.exp(torch.clamp(log_std, min=-20, max=2))
+                        
+                        param_dist = torch.distributions.Normal(torch.zeros_like(std), std)
+                        param_entropy = param_dist.entropy()
+                    else:
+                        # Discrete parameter: Categorical distribution entropy
+                        param_dist = torch.distributions.Categorical(logits=param_input)
+                        param_entropy = param_dist.entropy()
+                    
+                    entropies.append(param_entropy)
+                
+                return torch.stack(entropies, dim=-1).sum(dim=-1)
+        
+        return HybridActionDistribution
+    
+    @override(TorchRLModule)
+    def get_exploration_action_dist_cls(self):
+        return self.get_train_action_dist_cls()
+    
+    @override(TorchRLModule)
+    def get_inference_action_dist_cls(self):
+        return self.get_train_action_dist_cls()
